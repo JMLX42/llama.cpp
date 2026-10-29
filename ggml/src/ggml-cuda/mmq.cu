@@ -1,9 +1,26 @@
 #include "common.cuh"
+#include "tiled.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
 #include <cstdint>
+
+static void ggml_cuda_mul_mat_q_switch_type_tiled(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    switch (args.type_x) {
+        case GGML_TYPE_Q8_0:
+            mul_mat_q_case_tiled<GGML_TYPE_Q8_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_K:
+            mul_mat_q_case_tiled<GGML_TYPE_Q4_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_q_case_tiled<GGML_TYPE_Q6_K>(ctx, args, stream);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -300,6 +317,10 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, J_best, fusion_device};
+        if (ggml_cuda_tiled_is_tiled(src0)) {
+            ggml_cuda_mul_mat_q_switch_type_tiled(ctx, args, stream);
+            return;
+        }
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
