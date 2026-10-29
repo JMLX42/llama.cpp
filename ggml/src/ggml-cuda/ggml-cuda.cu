@@ -728,7 +728,11 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(g
                                                                                int                         device,
                                                                                [[maybe_unused]] int        stream_no) {
 #if defined(GGML_USE_VMM)
-    if (ggml_cuda_info().devices[device].vmm) {
+    // GGML_CUDA_NO_VMM_POOL=1: legacy pool (ggml_cuda_device_malloc, managed memory with
+    // GGML_CUDA_ENABLE_UNIFIED_MEMORY=1) instead of cuMemCreate, which can fail on Jetson when the kernel can't
+    // provide contiguous memory (NvMap error 12)
+    static const bool no_vmm_pool = ggml_cuda_env_flag("GGML_CUDA_NO_VMM_POOL");
+    if (ggml_cuda_info().devices[device].vmm && !no_vmm_pool) {
         return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
     }
 #endif // defined(GGML_USE_VMM)
