@@ -1,19 +1,25 @@
 # CUDA tiled weights (Jetson Orin)
 
-Branch `jetson-tiled-weights` (based on `v0.8.0`): an opt-in rearrangement of quantized weights for faster
-generation on bandwidth-bound GPUs, developed and measured on a Jetson Orin Nano Super 8 GB.
+Branches `jetson-tiled-weights` (dense weights) and `jetson-tiled-moe` (adds expert weights), based on `v0.8.0`: an
+opt-in rearrangement of quantized weights for faster generation on bandwidth-bound GPUs, developed and measured on a
+Jetson Orin Nano Super 8 GB.
 
 ## What it does
 
 With `GGML_CUDA_TILED=1`:
 
-- **Load time:** every Q8_0 / Q4_K / Q6_K weight matrix (2D, `ne0 % 256 == 0`, `ne1 % 16 == 0`, in a weights
-  buffer) is rearranged in place on the GPU as soon as its upload completes: rows in tiles of 16, each 32-element
+- **Load time:** every Q8_0 / Q4_K / Q6_K weight matrix (2D, or stacked experts / batched matrices,
+  `ne0 % 256 == 0`, `ne1 % 16 == 0`, in a weights buffer) is rearranged in place on the GPU as soon as its upload completes: rows in tiles of 16, each 32-element
   block stored in the per-lane A-fragment order of `mma.sync m16n8k32` (s8). Same bytes as the native rows (Q4_K
   keeps its packed scales), so no extra memory.
 - **Batches of up to 8 tokens** (plain decoding, DFlash verification, drafter head): int8 tensor-core kernels read
   the tiles directly (`ggml/src/ggml-cuda/tiled.cu`).
-- **Larger batches** (prompt processing): llama.cpp's `mul_mat_q` kernels, instantiated a second time with a
+- **Expert weights (`MUL_MAT_ID`), batches of up to 8 tokens:** a grouping kernel reads the router's expert ids on
+  the GPU (no host sync, CUDA graphs keep working) and assigns each token to the active experts it selected; the
+  activations are quantized straight into per-expert column blocks, and the tiled kernel runs one grid row per active
+  expert, so each selected expert's weights are read once per batch. A gate `MUL_MAT_ID`, up `MUL_MAT_ID`, SwiGLU
+  sequence is fused: every warp streams the gate and up tiles of the same rows and writes `silu(gate) * up`.
+- **Larger batches** (prompt processing, dense and expert weights): llama.cpp's `mul_mat_q` kernels, instantiated a second time with a
   `tiled` template parameter whose tile loaders (`mmq-load-tiles.cuh`, `*_tiled`) read the tiled layout. Each thread
   copies whole 16-byte fragments (coalesced) into the same shared-memory tile the native loaders build, so the rest
   of `mul_mat_q` is unchanged. The stock instances are compiled exactly as before (same registers / stack per
@@ -26,7 +32,8 @@ With `GGML_CUDA_TILED=1`:
 
 Without the variable the binary behaves like stock llama.cpp.
 
-Tuning knobs: `GGML_CUDA_TILED_MAX_COLS` (largest batch for the tiled kernel, default 8),
+Tuning knobs: `GGML_CUDA_TILED_MAX_COLS` (largest batch for the tiled kernels, default 8, at most 64 tokens
+for expert weights),
 `GGML_CUDA_TILED_ANY_BUFFER=1` (tile tensors outside weight buffers too; for `test-backend-ops`).
 
 ## Build
@@ -38,7 +45,12 @@ with `GGML_CUDA_TILED=1`.
 
 - `test-backend-ops -b CUDA0 -o MUL_MAT`, with `GGML_CUDA_TILED=1 GGML_CUDA_TILED_ANY_BUFFER=1` and without: 2490/2490 pass
   (90 cases take the tiled path; Nsight confirms the tiled kernels run).
+- `test-backend-ops -b CUDA0 -o MUL_MAT_ID`, same settings: 931/931 pass (tiled expert kernel for Q8_0 / Q4_K /
+  Q6_K and the tiled `mul_mat_q` expert path run).
 - Perplexity (Bolt E4B Q4_K_M, llama.cpp docs text, 20 x 512 tokens): 17.9151 stock, 17.9151 tiled.
+- LFM2.5-8B-A1B Q4_K_M (MoE): perplexity with `-ub 512` (tiled `mul_mat_q`) identical to stock (16.8229);
+  with `-ub 8` (fused expert kernel) KL divergence vs stock logits 0.0270, same top token 92.4%, the same level
+  as stock against itself with another batch size (0.0269 / 92.6%) or with fusion disabled (0.0251 / 93.5%).
 - Greedy server outputs, stock vs tiled: same answers; some outputs diverge in wording mid-text (rounding at near-ties,
   as between stock with and without DFlash).
 
@@ -70,6 +82,31 @@ Same binary, `GGML_CUDA_TILED` unset vs `=1`; "unpatched" is the stock v0.8.0 bu
 | DFlash, prompt processing | 473-499 | 517-562 | 1.09-1.13x |
 
 Model load takes ~1 s longer (one-time rearrangement).
+
+## Results: LFM2.5-8B-A1B Q4_K_M (MoE, 32 experts, 4 active; 2026-10-29, same board)
+
+`llama-bench` (`-ngl 99 -fa 1 -lm dio -ub 512`):
+
+| test | stock | tiled | |
+|---|---|---|---|
+| tg128 (generation) | 42.4 t/s | 64.9 t/s | 1.53x |
+| pp512 | 992 t/s | 1006 t/s | 1.01x |
+
+Generation by step: dense layers only tiled 51.3 t/s; + tiled experts 60.8; + fused gate/up/SwiGLU 64.9.
+
+`llama-server`, 32K q8_0 KV context, `-ub 512`, same prompts as above:
+
+| | stock | tiled | |
+|---|---|---|---|
+| plain decoding | 39.7-41.0 | 58.3-61.3 | 1.49x |
+| prompt processing | 839-979 | 856-990 | 1.01-1.02x |
+
+With the DSpark drafter (`--spec-type draft-dspark --spec-draft-n-max 10`, 16K context, `-ub 256`), tiled with
+`GGML_CUDA_TILED_MAX_COLS=16`: 43-74 t/s (stock 37-63), mostly below plain tiled decoding: the drafter's acceptance
+is too low for this model.
+
+Per generated token (tiled, Nsight): expert matmuls ~61-72 GB/s, dense ~66 GB/s, output head ~82 GB/s; about 1 GB
+of weights per token, so the bandwidth ceiling is ~100 t/s.
 
 ### History of the prompt-processing path
 

@@ -401,6 +401,10 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ne12, J_best};
 
+    if (ggml_cuda_tiled_is_tiled(src0)) {
+        ggml_cuda_mul_mat_q_switch_type_tiled(ctx, args, stream);
+        return;
+    }
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 

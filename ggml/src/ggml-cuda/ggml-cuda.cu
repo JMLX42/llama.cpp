@@ -2049,15 +2049,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_pool_alloc<char> src0_native_data(ctx.pool());
     if (ggml_cuda_tiled_is_tiled(src0)) {
         const bool mmq = ggml_cuda_should_use_mmq(src0->type, ggml_cuda_info().devices[ctx.device].cc, ne11, /*n_experts =*/ 0);
-        if (ggml_cuda_tiled_large_batch(src1) && mmq) {
+        if (ggml_cuda_tiled_large_batch(src0, src1) && mmq) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);  // reads the tiled layout directly
             return;
         }
-        if (!ggml_cuda_tiled_large_batch(src1) || !ggml_cuda_tiled_native_copy_ok(src0)) {
+        const bool tiled_ok = ggml_cuda_tiled_mul_mat_supported(src0, src1, dst);
+        if ((!ggml_cuda_tiled_large_batch(src0, src1) && tiled_ok) || !ggml_cuda_tiled_native_copy_ok(src0)) {
+            GGML_ASSERT(tiled_ok && "unsupported operand layout for a tiled weight; unset GGML_CUDA_TILED");
             ggml_cuda_tiled_mul_mat(ctx, src0, src1, dst);
             return;
         }
-        // large batch for llama.cpp's other kernels below: run them on a temporary native copy of the weight
+        // large batch for llama.cpp's other kernels, or operand layouts the tiled kernel doesn't handle: run llama.cpp's
+        // kernels below on a temporary native copy of the weight
         src0_native_data.alloc(ggml_cuda_tiled_native_copy_size(src0));
         ggml_cuda_tiled_to_native(src0, src0_native_data.get(), ctx.stream());
         src0_native      = *src0;
@@ -2119,6 +2122,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    if (ggml_cuda_tiled_is_tiled(src0)) {
+        return false;  // ggml_cuda_tiled_mul_mat_id or mul_mat_q, see ggml_cuda_mul_mat_id
+    }
+
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -2158,6 +2165,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    if (ggml_cuda_tiled_is_tiled(src0)) {
+        if (!ggml_cuda_tiled_large_batch_id(src1)) {
+            ggml_cuda_tiled_mul_mat_id(ctx, src0, src1, ids, dst);
+            return;
+        }
+        // larger batches: mul_mat_q reads the tiled layout directly
+        GGML_ASSERT(ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02) &&
+                    "tiled expert weights need mul_mat_q for large batches; unset GGML_CUDA_TILED");
+        ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2322,7 +2341,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_repeat_back(ctx, dst);
             break;
         case GGML_OP_GET_ROWS:
-            ggml_cuda_op_get_rows(ctx, dst);
+            if (ggml_cuda_tiled_is_tiled(dst->src[0])) {
+                ggml_cuda_tiled_get_rows(ctx, dst);
+            } else {
+                ggml_cuda_op_get_rows(ctx, dst);
+            }
             break;
         case GGML_OP_GET_ROWS_BACK:
             ggml_cuda_op_get_rows_back(ctx, dst);
@@ -3900,6 +3923,35 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// MUL_MAT_ID gate, MUL_MAT_ID up, SwiGLU on tiled expert weights with a small batch: one tiled kernel for all three.
+static int ggml_cuda_try_tiled_glu_fusion(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (i + 2 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID ||
+        cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT_ID || cgraph->nodes[i + 2]->op != GGML_OP_GLU) {
+        return 0;
+    }
+    ggml_tensor *       glu  = cgraph->nodes[i + 2];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!((gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]))) {
+        return 0;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+        !ggml_cuda_tiled_is_tiled(up->src[0]) || !ggml_cuda_tiled_is_tiled(gate->src[0]) ||
+        up->src[0]->type != gate->src[0]->type || !ggml_are_same_shape(up->src[0], gate->src[0]) ||
+        up->src[1] != gate->src[1] || up->src[2] != gate->src[2] || ggml_cuda_tiled_large_batch_id(up->src[1]) ||
+        up->src[1]->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || !ggml_are_same_shape(glu, up)) {
+        return 0;
+    }
+    const ggml_op ops[]       = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+    const int     out_nodes[] = { i + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+        return 0;
+    }
+    ggml_cuda_tiled_mul_mat_id(*cuda_ctx, up->src[0], up->src[1], up->src[2], glu, gate->src[0]);
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -3907,6 +3959,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (const int n = ggml_cuda_try_tiled_glu_fusion(cuda_ctx, cgraph, i)) {
+        return n;
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

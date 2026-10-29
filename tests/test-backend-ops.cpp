@@ -10210,6 +10210,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // rows in multiples of 16: weights the CUDA backend can tile (GGML_CUDA_TILED=1 GGML_CUDA_TILED_ANY_BUFFER=1)
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int b : {1, 3}) {
+            for (bool v : {false, true}) {
+                test_cases.emplace_back(new test_get_rows(type, 512, 48, 7, b, 1, v));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)

@@ -4,10 +4,11 @@
 
 // Tiled weights (enabled with GGML_CUDA_TILED=1).
 //
-// Q8_0 / Q4_K / Q6_K weight matrices (2D, ne0 % 256 == 0, ne1 % 16 == 0, in a weights buffer) are rearranged in place
-// once their upload completes: rows are grouped in tiles of 16 and each 32-element block of a tile is stored in the
-// per-lane A-fragment order of mma.sync m16n8k32 (s8), so that a lane fetches its fragment with one 16-byte load.
-// Every MUL_MAT on such a weight then runs on int8 tensor-core kernels, for any batch size.
+// Q8_0 / Q4_K / Q6_K weight matrices (2D or stacked experts, ne0 % 256 == 0, ne1 % 16 == 0, in a weights buffer)
+// are rearranged in place once their upload completes: rows are grouped in tiles of 16 and each 32-element block of a
+// tile is stored in the per-lane A-fragment order of mma.sync m16n8k32 (s8), so that a lane fetches its fragment with
+// one 16-byte load. Every MUL_MAT / MUL_MAT_ID on such a weight then runs on int8 tensor-core kernels, for any batch
+// size.
 // GGML_CUDA_TILED_ANY_BUFFER=1 also tiles tensors outside weight buffers (for test-backend-ops).
 
 // Called after (part of) a tensor was uploaded on `stream`; tiles the tensor once all of its bytes have been written.
@@ -31,7 +32,7 @@ bool ggml_cuda_tiled_read(const ggml_tensor * tensor, void * data, size_t offset
 
 // Whether a batch is large enough for llama.cpp's own kernels (mul_mat_q reads tiled weights directly) rather than
 // ggml_cuda_tiled_mul_mat. GGML_CUDA_TILED_MAX_COLS sets the largest batch for the tiled kernel (default 8).
-bool ggml_cuda_tiled_large_batch(const ggml_tensor * src1);
+bool ggml_cuda_tiled_large_batch(const ggml_tensor * src0, const ggml_tensor * src1);
 
 // Whether a temporary native copy of `src0` is small enough, for kernels that can't read the tiled layout.
 bool ggml_cuda_tiled_native_copy_ok(const ggml_tensor * src0);
@@ -42,4 +43,19 @@ size_t ggml_cuda_tiled_native_copy_size(const ggml_tensor * src0);
 // Writes a native copy of tiled `src0` to device memory `dst` on `stream`.
 void ggml_cuda_tiled_to_native(const ggml_tensor * src0, void * dst, cudaStream_t stream);
 
+// Whether ggml_cuda_tiled_mul_mat handles these operand layouts (f32, contiguous columns).
+bool ggml_cuda_tiled_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
 void ggml_cuda_tiled_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Whether a MUL_MAT_ID batch has too many tokens for ggml_cuda_tiled_mul_mat_id (GGML_CUDA_TILED_MAX_COLS, at most 64).
+bool ggml_cuda_tiled_large_batch_id(const ggml_tensor * src1);
+
+// MUL_MAT_ID on tiled expert weights (src0 ne2 = experts): tokens are grouped by expert on the device, so each
+// selected expert's weights are read once per batch. With `gate` (tiled, same shape as src0), dst = SwiGLU:
+// silu(gate . src1) * (src0 . src1).
+void ggml_cuda_tiled_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * gate = nullptr);
+
+// GET_ROWS from a tiled weight (F32 output): dequantizes the gathered rows from the tiled layout.
+void ggml_cuda_tiled_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
